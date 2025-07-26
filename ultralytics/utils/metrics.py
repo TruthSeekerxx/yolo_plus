@@ -394,6 +394,7 @@ class ConfusionMatrix(DataExportMixin):
             conf (float, optional): Confidence threshold for detections.
             iou_thres (float, optional): IoU threshold for matching detections to ground truth.
         """
+        
         gt_cls, gt_bboxes = batch["cls"], batch["bboxes"]
         if self.matches is not None:  # only if visualization is enabled
             self.matches = {k: defaultdict(list) for k in {"TP", "FP", "FN", "GT"}}
@@ -402,16 +403,26 @@ class ConfusionMatrix(DataExportMixin):
         is_obb = gt_bboxes.shape[1] == 5  # check if boxes contains angle for OBB
         conf = 0.25 if conf in {None, 0.01 if is_obb else 0.001} else conf  # apply 0.25 if default val conf is passed
         no_pred = len(detections["cls"]) == 0
+        print(f"Detections: {detections['cls'].tolist() if len(detections['cls']) > 0 else 'None'}, Conf: {detections['conf'].tolist() if len(detections['conf']) > 0 else 'None'}")
+        print(f"GT classes: {gt_cls.tolist()}")
         if gt_cls.shape[0] == 0:  # Check if labels is empty
             if not no_pred:
                 detections = {k: detections[k][detections["conf"] > conf] for k in detections.keys()}
                 detection_classes = detections["cls"].int().tolist()
+                # Clip detection_classes to valid range
+                detection_classes = [min(max(dc, 0), self.nc - 1) for dc in detection_classes]
+                if any(dc >= self.nc for dc in detection_classes):
+                    LOGGER.warning(f"Invalid predicted class in detections: {detection_classes}")
                 for i, dc in enumerate(detection_classes):
                     self.matrix[dc, self.nc] += 1  # FP
                     self._append_matches("FP", detections, i)
             return
         if no_pred:
             gt_classes = gt_cls.int().tolist()
+            # Clip gt_classes to valid range
+            gt_classes = [min(max(gc, 0), self.nc - 1) for gc in gt_classes]
+            if any(gc >= self.nc for gc in gt_classes):
+                LOGGER.warning(f"Invalid GT class in batch: {gt_classes}")
             for i, gc in enumerate(gt_classes):
                 self.matrix[self.nc, gc] += 1  # FN
                 self._append_matches("FN", batch, i)
@@ -420,6 +431,13 @@ class ConfusionMatrix(DataExportMixin):
         detections = {k: detections[k][detections["conf"] > conf] for k in detections.keys()}
         gt_classes = gt_cls.int().tolist()
         detection_classes = detections["cls"].int().tolist()
+        # Clip to valid range
+        detection_classes = [min(max(dc, 0), self.nc - 1) for dc in detection_classes]
+        gt_classes = [min(max(gc, 0), self.nc - 1) for gc in gt_classes]
+        if any(dc >= self.nc for dc in detection_classes):
+            LOGGER.warning(f"Invalid predicted class in detections: {detection_classes}")
+        if any(gc >= self.nc for gc in gt_classes):
+            LOGGER.warning(f"Invalid GT class in batch: {gt_classes}")
         bboxes = detections["bboxes"]
         iou = batch_probiou(gt_bboxes, bboxes) if is_obb else box_iou(gt_bboxes, bboxes)
 

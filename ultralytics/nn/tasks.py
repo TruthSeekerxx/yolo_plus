@@ -416,7 +416,11 @@ class DetectionModel(BaseModel):
 
             self.model.eval()  # Avoid changing batch statistics until training begins
             m.training = True  # Setting it to True to properly return strides
-            m.stride = torch.tensor([s / x.shape[-2] for x in _forward(torch.zeros(1, ch, s, s))])  # forward
+            with torch.no_grad():
+                # Use a smaller input size to avoid memory issues and ensure compatibility
+                input_tensor = torch.zeros(1, ch, 64, 64).to(next(self.model.parameters()).device)
+                output = _forward(input_tensor)
+                m.stride = torch.tensor([s / x.shape[-2] for x in output]) if isinstance(output, (list, tuple)) else torch.tensor([s / output.shape[-2]])
             self.stride = m.stride
             self.model.train()  # Set model back to training(default) mode
             m.bias_init()  # only run once
@@ -1573,22 +1577,10 @@ def attempt_load_one_weight(weight, device=None, inplace=True, fuse=False):
 
 
 def parse_model(d, ch, verbose=True):
-    """
-    Parse a YOLO model.yaml dictionary into a PyTorch model.
-
-    Args:
-        d (dict): Model dictionary.
-        ch (int): Input channels.
-        verbose (bool): Whether to print model details.
-
-    Returns:
-        model (torch.nn.Sequential): PyTorch model.
-        save (list): Sorted list of output layers.
-    """
     import ast
 
     # Args
-    legacy = True  # backward compatibility for v3/v5/v8/v9 models
+    legacy = True
     max_channels = float("inf")
     nc, act, scales = (d.get(x) for x in ("nc", "activation", "scales"))
     depth, width, kpt_shape = (d.get(x, 1.0) for x in ("depth_multiple", "width_multiple", "kpt_shape"))
@@ -1600,14 +1592,14 @@ def parse_model(d, ch, verbose=True):
         depth, width, max_channels = scales[scale]
 
     if act:
-        Conv.default_act = eval(act)  # redefine default activation, i.e. Conv.default_act = torch.nn.SiLU()
+        Conv.default_act = eval(act)
         if verbose:
-            LOGGER.info(f"{colorstr('activation:')} {act}")  # print
+            LOGGER.info(f"{colorstr('activation:')} {act}")
 
     if verbose:
         LOGGER.info(f"\n{'':>3}{'from':>20}{'n':>3}{'params':>10}  {'module':<45}{'arguments':<30}")
     ch = [ch]
-    layers, save, c2 = [], [], ch[-1]  # layers, savelist, ch out
+    layers, save, c2 = [], [], ch[-1]
     base_modules = frozenset(
         {
             Classify,
@@ -1646,7 +1638,7 @@ def parse_model(d, ch, verbose=True):
             A2C2f,
         }
     )
-    repeat_modules = frozenset(  # modules with 'repeat' arguments
+    repeat_modules = frozenset(
         {
             BottleneckCSP,
             C1,
@@ -1665,48 +1657,61 @@ def parse_model(d, ch, verbose=True):
             A2C2f,
         }
     )
-    for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args
+    for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):
         m = (
             getattr(torch.nn, m[3:])
             if "nn." in m
             else getattr(__import__("torchvision").ops, m[16:])
             if "torchvision.ops." in m
             else globals()[m]
-        )  # get module
+        )
+        # Handle keyword arguments for Detect and similar heads
+        if m in {Detect, WorldDetect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, v10Detect}:
+            kwargs = {}
+            ch_head = [ch[x] for x in f]
+            if isinstance(args, dict):  # Direct dictionary args
+                kwargs = args
+                args = []
+                print(f"Found kwargs for {m.__name__}: {kwargs}")
+            elif args and isinstance(args[-1], dict):  # Dictionary as last arg in list
+                kwargs = args.pop(-1)
+                print(f"Found kwargs for {m.__name__}: {kwargs}")
+        else:
+            kwargs = {}  # Default empty kwargs for non-Detect modules
+        # Process remaining args
         for j, a in enumerate(args):
             if isinstance(a, str):
                 with contextlib.suppress(ValueError):
                     args[j] = locals()[a] if a in locals() else ast.literal_eval(a)
-        n = n_ = max(round(n * depth), 1) if n > 1 else n  # depth gain
+        n = n_ = max(round(n * depth), 1) if n > 1 else n
         if m in base_modules:
             c1, c2 = ch[f], args[0]
-            if c2 != nc:  # if c2 not equal to number of classes (i.e. for Classify() output)
+            if c2 != nc:
                 c2 = make_divisible(min(c2, max_channels) * width, 8)
-            if m is C2fAttn:  # set 1) embed channels and 2) num heads
+            if m is C2fAttn:
                 args[1] = make_divisible(min(args[1], max_channels // 2) * width, 8)
                 args[2] = int(max(round(min(args[2], max_channels // 2 // 32)) * width, 1) if args[2] > 1 else args[2])
-
             args = [c1, c2, *args[1:]]
             if m in repeat_modules:
-                args.insert(2, n)  # number of repeats
+                args.insert(2, n)
                 n = 1
-            if m is C3k2:  # for M/L/X sizes
+            if m is C3k2:
                 legacy = False
                 if scale in "mlx":
                     args[3] = True
             if m is A2C2f:
                 legacy = False
-                if scale in "lx":  # for L/X sizes
+                if scale in "lx":
                     args.extend((True, 1.2))
             if m is C2fCIB:
                 legacy = False
         elif m is AIFI:
             args = [ch[f], *args]
-        elif m in frozenset({HGStem, HGBlock}):
+        elif m in {HGStem, HGBlock}:
             c1, cm, c2 = ch[f], args[0], args[1]
             args = [c1, cm, c2, *args[2:]]
             if m is HGBlock:
-                args.insert(4, n)  # number of repeats
+                args.insert(4, n)
                 n = 1
         elif m is ResNetLayer:
             c2 = args[1] if args[3] else args[1] * 4
@@ -1714,15 +1719,20 @@ def parse_model(d, ch, verbose=True):
             args = [ch[f]]
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
-        elif m in frozenset(
-            {Detect, WorldDetect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, ImagePoolingAttn, v10Detect}
-        ):
-            args.append([ch[x] for x in f])
+        elif m in {Detect, WorldDetect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, ImagePoolingAttn, v10Detect}:
+            if m in {Detect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB}:
+                nc_head = kwargs.get('nc', nc)
+                ch_head = kwargs.get('ch', ch_head)
+                extra_regs = kwargs.get('extra_regs', 0)
+                args = [nc_head, ch_head, extra_regs]
+                print(f"Constructed args for {m.__name__}: {args}")
+                m.legacy = legacy
+                kwargs = {}  # Clear kwargs to avoid duplication
+            else:
+                args.append(ch_head)
             if m is Segment or m is YOLOESegment:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
-            if m in {Detect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB}:
-                m.legacy = legacy
-        elif m is RTDETRDecoder:  # special case, channels arg must be passed in index 1
+        elif m is RTDETRDecoder:
             args.insert(1, [ch[x] for x in f])
         elif m is CBLinear:
             c2 = args[0]
@@ -1730,25 +1740,25 @@ def parse_model(d, ch, verbose=True):
             args = [c1, c2, *args[1:]]
         elif m is CBFuse:
             c2 = ch[f[-1]]
-        elif m in frozenset({TorchVision, Index}):
+        elif m in {TorchVision, Index}:
             c2 = args[0]
             c1 = ch[f]
-            args = [*args[1:]]
+            args = [c1, *args[1:]]
         else:
             c2 = ch[f]
 
-        m_ = torch.nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)  # module
-        t = str(m)[8:-2].replace("__main__.", "")  # module type
-        m_.np = sum(x.numel() for x in m_.parameters())  # number params
-        m_.i, m_.f, m_.type = i, f, t  # attach index, 'from' index, type
+        m_ = nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)
+        t = str(m)[8:-2].replace("__main__.", "")
+        m_.np = sum(x.numel() for x in m_.parameters())
+        m_.i, m_.f, m_.type = i, f, t
         if verbose:
-            LOGGER.info(f"{i:>3}{str(f):>20}{n_:>3}{m_.np:10.0f}  {t:<45}{str(args):<30}")  # print
-        save.extend(x % i for x in ([f] if isinstance(f, int) else f) if x != -1)  # append to savelist
+            LOGGER.info(f"{i:>3}{str(f):>20}{n_:>3}{m_.np:10.0f}  {t:<45}{str(args):<30}")
+        save.extend(x % i for x in ([f] if isinstance(f, int) else f) if x != -1)
         layers.append(m_)
         if i == 0:
             ch = []
         ch.append(c2)
-    return torch.nn.Sequential(*layers), sorted(save)
+    return nn.Sequential(*layers), sorted(save)
 
 
 def yaml_model_load(path):

@@ -1,35 +1,6 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 """
 Run prediction on images, videos, directories, globs, YouTube, webcam, streams, etc.
-
-Usage - sources:
-    $ yolo mode=predict model=yolo11n.pt source=0                               # webcam
-                                                img.jpg                         # image
-                                                vid.mp4                         # video
-                                                screen                          # screenshot
-                                                path/                           # directory
-                                                list.txt                        # list of images
-                                                list.streams                    # list of streams
-                                                'path/*.jpg'                    # glob
-                                                'https://youtu.be/LNwODJXcvt4'  # YouTube
-                                                'rtsp://example.com/media.mp4'  # RTSP, RTMP, HTTP, TCP stream
-
-Usage - formats:
-    $ yolo mode=predict model=yolo11n.pt                 # PyTorch
-                              yolo11n.torchscript        # TorchScript
-                              yolo11n.onnx               # ONNX Runtime or OpenCV DNN with dnn=True
-                              yolo11n_openvino_model     # OpenVINO
-                              yolo11n.engine             # TensorRT
-                              yolo11n.mlpackage          # CoreML (macOS-only)
-                              yolo11n_saved_model        # TensorFlow SavedModel
-                              yolo11n.pb                 # TensorFlow GraphDef
-                              yolo11n.tflite             # TensorFlow Lite
-                              yolo11n_edgetpu.tflite     # TensorFlow Edge TPU
-                              yolo11n_paddle_model       # PaddlePaddle
-                              yolo11n.mnn                # MNN
-                              yolo11n_ncnn_model         # NCNN
-                              yolo11n_imx_model          # Sony IMX
-                              yolo11n_rknn_model         # Rockchip RKNN
 """
 
 import platform
@@ -50,6 +21,8 @@ from ultralytics.utils import DEFAULT_CFG, LOGGER, MACOS, WINDOWS, callbacks, co
 from ultralytics.utils.checks import check_imgsz, check_imshow
 from ultralytics.utils.files import increment_path
 from ultralytics.utils.torch_utils import select_device, smart_inference_mode
+from ultralytics.utils.ops import Profile
+from ultralytics.engine.results import Results  # Add this import for Results class
 
 STREAM_WARNING = """
 inference results will accumulate in RAM unless `stream=True` is passed, causing potential out-of-memory
@@ -200,10 +173,35 @@ class BasePredictor:
             stride=self.model.stride,
         )
         return [letterbox(image=x) for x in im]
-
+    
     def postprocess(self, preds, img, orig_imgs):
         """Post-process predictions for an image and return them."""
-        return preds
+        # NEW: Get nm from model head (extra_regs)
+        nm = getattr(self.model.model[-1], 'nm', 0) if hasattr(self.model, 'model') else 0  # extra_regs as nm
+        preds = ops.non_max_suppression(
+            preds,
+            conf_thres=self.args.conf,
+            iou_thres=self.args.iou,
+            classes=None,
+            agnostic=False,
+            max_det=self.args.max_det,
+            nc=self.model.nc,  # Explicitly pass nc to NMS
+            nm=nm,  # Treat extra_regs like nm (appended after cls)
+        )
+        # Slice to discard extras for standard Boxes/Results (keep only first 6 columns: xyxy + conf + cls)
+        for i in range(len(preds)):
+            if preds[i].numel() and nm > 0:
+                preds[i] = preds[i][:, :6]  # Discard extras for validation/inference compatibility
+
+        results = []
+        for i, pred in enumerate(preds):
+            orig_img = orig_imgs[i] if isinstance(orig_imgs, list) else orig_imgs
+            if not len(pred):
+                pred[:, :4] = pred[:, :4].round()
+            path = self.batch[0]
+            img_path = path[i] if isinstance(path, list) else path
+            results.append(Results(orig_img=orig_img, path=img_path, names=self.model.names, boxes=pred))
+        return results
 
     def __call__(self, source=None, model=None, stream: bool = False, *args, **kwargs):
         """
@@ -221,28 +219,13 @@ class BasePredictor:
             (List[ultralytics.engine.results.Results] | generator): Results objects or generator of Results objects.
         """
         self.stream = stream
+
         if stream:
             return self.stream_inference(source, model, *args, **kwargs)
         else:
             return list(self.stream_inference(source, model, *args, **kwargs))  # merge list of Result into one
 
     def predict_cli(self, source=None, model=None):
-        """
-        Method used for Command Line Interface (CLI) prediction.
-
-        This function is designed to run predictions using the CLI. It sets up the source and model, then processes
-        the inputs in a streaming manner. This method ensures that no outputs accumulate in memory by consuming the
-        generator without storing results.
-
-        Args:
-            source (str | Path | List[str] | List[Path] | List[np.ndarray] | np.ndarray | torch.Tensor, optional):
-                Source for inference.
-            model (str | Path | torch.nn.Module, optional): Model for inference.
-
-        Note:
-            Do not modify this function or remove the generator. The generator ensures that no outputs are
-            accumulated in memory, which is critical for preventing memory issues during long-running predictions.
-        """
         gen = self.stream_inference(source, model)
         for _ in gen:  # sourcery skip: remove-empty-nested-block, noqa
             pass
@@ -312,9 +295,9 @@ class BasePredictor:
 
             self.seen, self.windows, self.batch = 0, [], None
             profilers = (
-                ops.Profile(device=self.device),
-                ops.Profile(device=self.device),
-                ops.Profile(device=self.device),
+                Profile(device=self.device),
+                Profile(device=self.device),
+                Profile(device=self.device),
             )
             self.run_callbacks("on_predict_start")
             for self.batch in self.dataset:
@@ -339,6 +322,7 @@ class BasePredictor:
 
                 # Visualize, save, write results
                 n = len(im0s)
+                print(n)
                 try:
                     for i in range(n):
                         self.seen += 1

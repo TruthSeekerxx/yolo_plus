@@ -56,6 +56,8 @@ class YOLODataset(BaseDataset):
         use_keypoints (bool): Indicates if keypoints should be used for pose estimation.
         use_obb (bool): Indicates if oriented bounding boxes should be used.
         data (dict): Dataset configuration dictionary.
+        bbox_format (str): Bounding box format ('xywh' for YOLO).
+        normalized (bool): Indicates if bounding box coordinates are normalized.
 
     Methods:
         cache_labels: Cache dataset labels, check images and read shapes.
@@ -84,7 +86,9 @@ class YOLODataset(BaseDataset):
         self.use_keypoints = task == "pose"
         self.use_obb = task == "obb"
         self.data = data
-        assert not (self.use_segments and self.use_keypoints), "Can not use both segments and keypoints."
+        self.bbox_format = "xywh"  # Bounding box format for YOLO
+        self.normalized = True  # Labels are normalized (coordinates in [0, 1])
+        assert not (self.use_segments and self.use_keypoints), "Cannot use both segments and keypoints."
         super().__init__(*args, channels=self.data["channels"], **kwargs)
 
     def cache_labels(self, path: Path = Path("./labels.cache")) -> Dict:
@@ -122,29 +126,29 @@ class YOLODataset(BaseDataset):
                 ),
             )
             pbar = TQDM(results, desc=desc, total=total)
-            for im_file, lb, shape, segments, keypoint, nm_f, nf_f, ne_f, nc_f, msg in pbar:
+            for im_file, lb, shape, segments, keypoint, regs, nm_f, nf_f, ne_f, nc_f, msg in pbar:
                 nm += nm_f
                 nf += nf_f
                 ne += ne_f
                 nc += nc_f
                 if im_file:
-                    x["labels"].append(
-                        {
-                            "im_file": im_file,
-                            "shape": shape,
-                            "cls": lb[:, 0:1],  # n, 1
-                            "bboxes": lb[:, 1:],  # n, 4
-                            "segments": segments,
-                            "keypoints": keypoint,
-                            "normalized": True,
-                            "bbox_format": "xywh",
-                        }
-                    )
+                    label_dict = {
+                        "im_file": im_file,
+                        "shape": shape if shape else (640, 640),  # Default to (640, 640) if shape is None
+                        "cls": lb[:, 0:1],  # n, 1
+                        "bboxes": lb[:, 1:5],  # n, 4 (x, y, w, h)
+                        "segments": segments,
+                        "keypoints": keypoint,
+                        "regs": lb[:, 5:] if lb.shape[1] >= 9 else np.zeros((lb.shape[0], 4), dtype=lb.dtype),  # n, 4 (reg1, reg2, reg3, reg4)
+                        "normalized": True,
+                        "bbox_format": "xywh",
+                    }
+                    x["labels"].append(label_dict)
                 if msg:
                     msgs.append(msg)
                 pbar.desc = f"{desc} {nf} images, {nm + ne} backgrounds, {nc} corrupt"
             pbar.close()
-
+            
         if msgs:
             LOGGER.info("\n".join(msgs))
         if nf == 0:
@@ -167,30 +171,26 @@ class YOLODataset(BaseDataset):
         self.label_files = img2label_paths(self.im_files)
         cache_path = Path(self.label_files[0]).parent.with_suffix(".cache")
         try:
-            cache, exists = load_dataset_cache_file(cache_path), True  # attempt to load a *.cache file
-            assert cache["version"] == DATASET_CACHE_VERSION  # matches current version
-            assert cache["hash"] == get_hash(self.label_files + self.im_files)  # identical hash
+            cache, exists = load_dataset_cache_file(cache_path), True
+            assert cache["version"] == DATASET_CACHE_VERSION
+            assert cache["hash"] == get_hash(self.label_files + self.im_files)
         except (FileNotFoundError, AssertionError, AttributeError):
-            cache, exists = self.cache_labels(cache_path), False  # run cache ops
+            cache, exists = self.cache_labels(cache_path), False
 
-        # Display cache
-        nf, nm, ne, nc, n = cache.pop("results")  # found, missing, empty, corrupt, total
+        nf, nm, ne, nc, n = cache.pop("results")
         if exists and LOCAL_RANK in {-1, 0}:
             d = f"Scanning {cache_path}... {nf} images, {nm + ne} backgrounds, {nc} corrupt"
-            TQDM(None, desc=self.prefix + d, total=n, initial=n)  # display results
+            TQDM(None, desc=self.prefix + d, total=n, initial=n)
             if cache["msgs"]:
-                LOGGER.info("\n".join(cache["msgs"]))  # display warnings
+                LOGGER.info("\n".join(cache["msgs"]))
 
-        # Read cache
-        [cache.pop(k) for k in ("hash", "version", "msgs")]  # remove items
+        [cache.pop(k) for k in ("hash", "version", "msgs")]
         labels = cache["labels"]
         if not labels:
             raise RuntimeError(
                 f"No valid images found in {cache_path}. Images with incorrectly formatted labels are ignored. {HELP_URL}"
             )
-        self.im_files = [lb["im_file"] for lb in labels]  # update im_files
-
-        # Check if the dataset is all boxes or all segments
+        self.im_files = [lb["im_file"] for lb in labels]
         lengths = ((len(lb["cls"]), len(lb["bboxes"]), len(lb["segments"])) for lb in labels)
         len_cls, len_boxes, len_segments = (sum(x) for x in zip(*lengths))
         if len_segments and len_boxes != len_segments:
@@ -232,7 +232,7 @@ class YOLODataset(BaseDataset):
                 batch_idx=True,
                 mask_ratio=hyp.mask_ratio,
                 mask_overlap=hyp.overlap_mask,
-                bgr=hyp.bgr if self.augment else 0.0,  # only affect training.
+                bgr=hyp.bgr if self.augment else 0.0,
             )
         )
         return transforms
@@ -250,37 +250,20 @@ class YOLODataset(BaseDataset):
         hyp.cutmix = 0.0
         self.transforms = self.build_transforms(hyp)
 
-    def update_labels_info(self, label: Dict) -> Dict:
+    def update_labels_info(self, label):
         """
-        Update label format for different tasks.
-
-        Args:
-            label (dict): Label dictionary containing bboxes, segments, keypoints, etc.
-
-        Returns:
-            (dict): Updated label dictionary with instances.
-
-        Note:
-            cls is not with bboxes now, classification and semantic segmentation need an independent cls label
-            Can also support classification and semantic segmentation by adding or removing dict keys there.
+        Custom your label format here on the fly.
+        The label format should be compatible with the Instances() class.
         """
-        bboxes = label.pop("bboxes")
-        segments = label.pop("segments", [])
-        keypoints = label.pop("keypoints", None)
-        bbox_format = label.pop("bbox_format")
-        normalized = label.pop("normalized")
-
-        # NOTE: do NOT resample oriented boxes
-        segment_resamples = 100 if self.use_obb else 1000
-        if len(segments) > 0:
-            # make sure segments interpolate correctly if original length is greater than segment_resamples
-            max_len = max(len(s) for s in segments)
-            segment_resamples = (max_len + 1) if segment_resamples < max_len else segment_resamples
-            # list[np.array(segment_resamples, 2)] * num_samples
-            segments = np.stack(resample_segments(segments, n=segment_resamples), axis=0)
-        else:
-            segments = np.zeros((0, segment_resamples, 2), dtype=np.float32)
-        label["instances"] = Instances(bboxes, segments, keypoints, bbox_format=bbox_format, normalized=normalized)
+        bboxes, segments, keypoints = label.pop("bboxes"), label.pop("segments"), label.pop("keypoints")
+        if bboxes.shape[1] > 4:
+            cls = bboxes[:, 0:1]
+            regs = bboxes[:, 5:] if bboxes.shape[1] >= 9 else np.zeros((bboxes.shape[0], 4), dtype=bboxes.dtype)
+            bboxes = bboxes[:, 1:5]
+            label["cls"] = cls
+            label["regs"] = regs
+        label["instances"] = Instances(bboxes, segments, keypoints, bbox_format=self.bbox_format, normalized=self.normalized)
+        label["original_shape"] = label.pop("shape", (640, 640))  # Default to (640, 640) if shape is missing
         return label
 
     @staticmethod
@@ -295,7 +278,7 @@ class YOLODataset(BaseDataset):
             (dict): Collated batch with stacked tensors.
         """
         new_batch = {}
-        batch = [dict(sorted(b.items())) for b in batch]  # make sure the keys are in the same order
+        batch = [dict(sorted(b.items())) for b in batch]
         keys = batch[0].keys()
         values = list(zip(*[list(b.values()) for b in batch]))
         for i, k in enumerate(keys):
@@ -304,15 +287,16 @@ class YOLODataset(BaseDataset):
                 value = torch.stack(value, 0)
             elif k == "visuals":
                 value = torch.nn.utils.rnn.pad_sequence(value, batch_first=True)
-            if k in {"masks", "keypoints", "bboxes", "cls", "segments", "obb"}:
+            if k in {"masks", "keypoints", "bboxes", "cls", "segments", "obb", "regs"}:
+                # Convert NumPy arrays to PyTorch tensors
+                value = [torch.tensor(v, dtype=torch.float32) if isinstance(v, np.ndarray) else v for v in value]
                 value = torch.cat(value, 0)
             new_batch[k] = value
         new_batch["batch_idx"] = list(new_batch["batch_idx"])
         for i in range(len(new_batch["batch_idx"])):
-            new_batch["batch_idx"][i] += i  # add target image index for build_targets()
+            new_batch["batch_idx"][i] += i
         new_batch["batch_idx"] = torch.cat(new_batch["batch_idx"], 0)
         return new_batch
-
 
 class YOLOMultiModalDataset(YOLODataset):
     """

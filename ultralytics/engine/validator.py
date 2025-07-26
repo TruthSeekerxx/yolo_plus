@@ -29,7 +29,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-
+from ultralytics.utils import ops
 from ultralytics.cfg import get_cfg, get_save_dir
 from ultralytics.data.utils import check_cls_dataset, check_det_dataset
 from ultralytics.nn.autobackend import AutoBackend
@@ -37,7 +37,7 @@ from ultralytics.utils import LOGGER, TQDM, callbacks, colorstr, emojis
 from ultralytics.utils.checks import check_imgsz
 from ultralytics.utils.ops import Profile
 from ultralytics.utils.torch_utils import de_parallel, select_device, smart_inference_mode
-
+from ultralytics.utils.metrics import ap_per_class, ConfusionMatrix
 
 class BaseValidator:
     """
@@ -116,11 +116,12 @@ class BaseValidator:
         self.iouv = None
         self.jdict = None
         self.speed = {"preprocess": 0.0, "inference": 0.0, "loss": 0.0, "postprocess": 0.0}
-
+        self.nm = 0
+        
         self.save_dir = save_dir or get_save_dir(self.args)
         (self.save_dir / "labels" if self.args.save_txt else self.save_dir).mkdir(parents=True, exist_ok=True)
         if self.args.conf is None:
-            self.args.conf = 0.01 if self.args.task == "obb" else 0.001  # reduce OBB val memory usage
+            self.args.conf = 0.00 if self.args.task == "obb" else 0.000
         self.args.imgsz = check_imgsz(self.args.imgsz, max_dim=1)
 
         self.plots = {}
@@ -219,6 +220,9 @@ class BaseValidator:
                 preds = self.postprocess(preds)
 
             self.update_metrics(preds, batch)
+            # After self.update_metrics(preds, batch)
+            self.save_predictions_with_extra(preds, batch, str(self.save_dir / "results.csv"))
+
             if self.args.plots and batch_i < 3:
                 self.plot_val_samples(batch, batch_i)
                 self.plot_predictions(batch, preds, batch_i)
@@ -310,32 +314,208 @@ class BaseValidator:
 
     def preprocess(self, batch):
         """Preprocess an input batch."""
+        print("HEREE")
+        batch["img"] = batch["img"].to(self.device, non_blocking=True)
+        batch["img"] = (batch["img"].half() if self.args.half else batch["img"].float()) / 255
+        for k in ["batch_idx", "cls", "bboxes"]:
+            batch[k] = batch[k].to(self.device)
         return batch
 
     def postprocess(self, preds):
         """Postprocess the predictions."""
-        return preds
+        print("HERE")
+        print(preds)
+        return ops.non_max_suppression(
+            preds,
+            conf_thres=self.args.conf,
+            iou_thres=self.args.iou,
+            classes=None,
+            agnostic=False,
+            max_det=self.args.max_det,
+            nc=self.nc,
+        )
 
     def init_metrics(self, model):
         """Initialize performance metrics for the YOLO model."""
-        pass
+        # Handle AutoBackend or standard model
+        if isinstance(model, AutoBackend):
+            inner_model = model.model  # Access the inner torch model
+        else:
+            inner_model = de_parallel(model)
+        
+        # Access the detection head (assuming it's the last module)
+        detect_head = inner_model.model[-1] if hasattr(inner_model, 'model') else inner_model
+        
+        self.nc = detect_head.nc
+        self.names = detect_head.names if hasattr(detect_head, 'names') else inner_model.names
+        self.nm = detect_head.extra_regs
+        
+        self.confusion_matrix = ConfusionMatrix(nc=self.nc)
+        self.iouv = torch.linspace(0.5, 0.95, 10).to(self.device)  # IoU thresholds for mAP@0.5:0.95
+        self.niou = self.iouv.numel()
+        self.stats = []  # List of per-image dicts: {'tp': tensor(N_preds, niou), 'conf': list, 'pred_cls': list, 'target_cls': list, 'extra_regs': list}
+        self.seen = 0
+        
+        
+    def save_predictions_with_extra(self, preds, batch, save_path):
+        """
+        Save predictions with extra regression outputs to CSV.
+        Each row: x1, y1, x2, y2, conf, cls, reg1, reg2, reg3, reg4,...
+        Handles both tensor and dict outputs.
+        """
+        with open(save_path, "a") as f:
+            for si, pred in enumerate(preds):
+                if pred is None or len(pred) == 0:
+                    continue
+                # Handle dict or tensor
+                if isinstance(pred, dict):
+                    # If 'det' key present, use it
+                    if "det" in pred:
+                        rows = pred["det"].cpu().numpy()
+                    else:
+                        # If there are other possible keys, handle as needed
+                        continue
+                else:
+                    rows = pred.cpu().numpy()
+                for row in rows:
+                    line = ",".join([f"{x:.6f}" for x in row])
+                    f.write(line + "\n")
+
+
 
     def update_metrics(self, preds, batch):
         """Update metrics based on predictions and batch."""
-        pass
-
+        n = len(preds)  # Number of images in batch
+        for si, pred in enumerate(preds):  # Per image
+            self.seen += 1
+            idx = (batch["batch_idx"] == si).nonzero().squeeze(-1)  # Indices for this image
+            if len(idx) == 0:  # No labels
+                continue
+    
+            # Ground truth
+            cls = batch["cls"][idx]
+            bbox = batch["bboxes"][idx]
+            nl = len(cls)
+            tcls = cls.tolist() if nl else []
+    
+            # Predictions
+            if pred is None or len(pred) == 0:
+                if nl:
+                    pass  # Metrics will reflect 0 recall
+                continue
+            predn = pred.clone()  # xyxy, conf, cls, reg1, reg2, reg3, reg4
+    
+            # Scale predictions from input scale to original shape
+            input_h, input_w = batch["img"][si].shape[1:]  # C H W, so [1:] = H W
+            ori_h, ori_w = batch["ori_shape"][si]
+            predn[:, :4] = ops.scale_boxes((input_h, input_w), predn[:, :4], (ori_h, ori_w))
+    
+            # Extract extra regression values (if any)
+            extra_regs = predn[:, 6:6+self.nm].cpu().tolist() if predn.shape[1] > 6 else []  # reg1, reg2, reg3, reg4
+    
+            # Scale ground truth from normalized (0-1) to original pixel scale
+            scale = torch.tensor([ori_w, ori_h, ori_w, ori_h], device=self.device)
+            tbox = ops.xywh2xyxy(bbox) * scale  # Convert to xyxy in original pixel
+    
+            if not nl:
+                continue
+    
+            # Compute IoU matrix (N_preds x N_gt)
+            iou = ops.bbox_iou(predn[:, :4], tbox, xyxy=True, CIoU=False)
+    
+            # Match predictions to GT
+            pred_cls = predn[:, 5]  # Class index
+            correct = self.match_predictions(pred_cls, cls, iou)
+    
+            # Confusion matrix update
+            labels = torch.cat((cls.view(-1, 1), tbox), 1)  # cls xyxy
+            detections = predn[:, :6]  # xyxy, conf, cls (ignore extra regs for confusion matrix)
+            self.confusion_matrix.process_batch(detections, labels)
+    
+            # Append per-image stats
+            detected_conf = predn[:, 4].cpu().tolist()
+            detected_cls = pred_cls.cpu().tolist()
+            self.stats.append({
+                'tp': correct.cpu(),
+                'conf': detected_conf,
+                'pred_cls': detected_cls,
+                'target_cls': tcls,
+                'extra_regs': extra_regs  # Store extra regressions
+            })
+            
     def finalize_metrics(self):
         """Finalize and return all metrics."""
-        pass
+        self.metrics = self.get_stats()
 
     def get_stats(self):
         """Return statistics about the model's performance."""
-        return {}
+        stats_list = self.stats
+        if not stats_list:
+            return {
+                "mp": 0.0,
+                "mr": 0.0,
+                "map50": 0.0,
+                "map": 0.0,
+                "ap": np.zeros((0, self.niou)),
+                "p": np.zeros(0),
+                "r": np.zeros(0),
+            }
+    
+        tp = [s['tp'] for s in stats_list]
+        conf = [s['conf'] for s in stats_list]
+        pred_cls = [s['pred_cls'] for s in stats_list]
+        target_cls = [s['target_cls'] for s in stats_list]
+    
+        # Flatten lists
+        conf_flat = [item for sublist in conf for item in sublist]
+        pred_cls_flat = [item for sublist in pred_cls for item in sublist]
+        target_cls_flat = [item for sublist in target_cls for item in sublist]
+    
+        # Convert to numpy arrays
+        conf_flat = np.array(conf_flat) if conf_flat else np.zeros(0)
+        pred_cls_flat = np.array(pred_cls_flat) if pred_cls_flat else np.zeros(0)
+        target_cls_flat = np.array(target_cls_flat) if target_cls_flat else np.zeros(0)
+    
+        tp_flat = torch.cat(tp, 0).cpu().numpy() if tp else np.zeros((0, self.niou))
+    
+        # Compute number of targets per class
+        self.nt = np.bincount(target_cls_flat.astype(int), minlength=self.nc)  # Store as self.nt
+    
+        # Use ap_per_class for standard computation
+        tp, fp, p, r, ap, unique_classes = ap_per_class(
+            tp=tp_flat,
+            conf=conf_flat,
+            pred_cls=pred_cls_flat,
+            target_cls=target_cls_flat,
+            plot=False,
+            save_dir=self.save_dir,
+            names=self.names
+        )
+    
+        # Averages
+        mp = p.mean() if len(p) else 0.0
+        mr = r.mean() if len(r) else 0.0
+        map50 = ap[:, 0].mean() if len(ap) else 0.0
+        map = ap.mean() if len(ap) else 0.0
+    
+        stats = {
+            "mp": mp,
+            "mr": mr,
+            "map50": map50,
+            "map": map,
+            "ap": ap,
+            "p": p,
+            "r": r,
+        }
+        return stats
 
     def print_results(self):
         """Print the results of the model's predictions."""
-        pass
-
+        pf = '%22s' + '%11s' * 6  # print format
+        LOGGER.info(pf % ('all', self.seen, sum([len(s['target_cls']) for s in self.stats]), self.metrics['mp'], self.metrics['mr'], self.metrics['map50'], self.metrics['map']))
+        for i in range(self.nc):
+            LOGGER.info(pf % (self.names[i], self.seen, self.nt[i], self.metrics['p'][i], self.metrics['r'][i], self.metrics['ap'][i, 0], self.metrics['ap'][i].mean()))
+    
     def get_desc(self):
         """Get description of the YOLO model."""
         pass

@@ -241,7 +241,7 @@ class Instances:
         self._bboxes = Bboxes(bboxes=bboxes, format=bbox_format)
         self.keypoints = keypoints
         self.normalized = normalized
-        self.segments = segments
+        self.segments = segments if segments is not None else []  # Ensure segments is a list if None
 
     def convert_bbox(self, format: str) -> None:
         """
@@ -269,8 +269,9 @@ class Instances:
         self._bboxes.mul(scale=(scale_w, scale_h, scale_w, scale_h))
         if bbox_only:
             return
-        self.segments[..., 0] *= scale_w
-        self.segments[..., 1] *= scale_h
+        if self.segments and isinstance(self.segments, np.ndarray):
+            self.segments[..., 0] *= scale_w
+            self.segments[..., 1] *= scale_h
         if self.keypoints is not None:
             self.keypoints[..., 0] *= scale_w
             self.keypoints[..., 1] *= scale_h
@@ -286,8 +287,9 @@ class Instances:
         if not self.normalized:
             return
         self._bboxes.mul(scale=(w, h, w, h))
-        self.segments[..., 0] *= w
-        self.segments[..., 1] *= h
+        if self.segments and isinstance(self.segments, np.ndarray):
+            self.segments[..., 0] *= w
+            self.segments[..., 1] *= h
         if self.keypoints is not None:
             self.keypoints[..., 0] *= w
             self.keypoints[..., 1] *= h
@@ -304,8 +306,9 @@ class Instances:
         if self.normalized:
             return
         self._bboxes.mul(scale=(1 / w, 1 / h, 1 / w, 1 / h))
-        self.segments[..., 0] /= w
-        self.segments[..., 1] /= h
+        if self.segments and isinstance(self.segments, np.ndarray):
+            self.segments[..., 0] /= w
+            self.segments[..., 1] /= h
         if self.keypoints is not None:
             self.keypoints[..., 0] /= w
             self.keypoints[..., 1] /= h
@@ -321,8 +324,9 @@ class Instances:
         """
         assert not self.normalized, "you should add padding with absolute coordinates."
         self._bboxes.add(offset=(padw, padh, padw, padh))
-        self.segments[..., 0] += padw
-        self.segments[..., 1] += padh
+        if self.segments and isinstance(self.segments, np.ndarray):
+            self.segments[..., 0] += padw
+            self.segments[..., 1] += padh
         if self.keypoints is not None:
             self.keypoints[..., 0] += padw
             self.keypoints[..., 1] += padh
@@ -367,7 +371,8 @@ class Instances:
             self.bboxes[:, 3] = h - y1
         else:
             self.bboxes[:, 1] = h - self.bboxes[:, 1]
-        self.segments[..., 1] = h - self.segments[..., 1]
+        if self.segments and isinstance(self.segments, np.ndarray):
+            self.segments[..., 1] = h - self.segments[..., 1]
         if self.keypoints is not None:
             self.keypoints[..., 1] = h - self.keypoints[..., 1]
 
@@ -385,7 +390,8 @@ class Instances:
             self.bboxes[:, 2] = w - x1
         else:
             self.bboxes[:, 0] = w - self.bboxes[:, 0]
-        self.segments[..., 0] = w - self.segments[..., 0]
+        if self.segments and isinstance(self.segments, np.ndarray):
+            self.segments[..., 0] = w - self.segments[..., 0]
         if self.keypoints is not None:
             self.keypoints[..., 0] = w - self.keypoints[..., 0]
 
@@ -403,8 +409,9 @@ class Instances:
         self.bboxes[:, [1, 3]] = self.bboxes[:, [1, 3]].clip(0, h)
         if ori_format != "xyxy":
             self.convert_bbox(format=ori_format)
-        self.segments[..., 0] = self.segments[..., 0].clip(0, w)
-        self.segments[..., 1] = self.segments[..., 1].clip(0, h)
+        if self.segments and isinstance(self.segments, np.ndarray):
+            self.segments[..., 0] = self.segments[..., 0].clip(0, w)
+            self.segments[..., 1] = self.segments[..., 1].clip(0, h)
         if self.keypoints is not None:
             # Set out of bounds visibility to zero
             self.keypoints[..., 2][
@@ -481,20 +488,24 @@ class Instances:
         normalized = instances_list[0].normalized
 
         cat_boxes = np.concatenate([ins.bboxes for ins in instances_list], axis=axis)
-        seg_len = [b.segments.shape[1] for b in instances_list]
+        seg_len = [b.segments.shape[1] for b in instances_list if isinstance(b.segments, np.ndarray) and len(b.segments)]
         if len(frozenset(seg_len)) > 1:  # resample segments if there's different length
-            max_len = max(seg_len)
+            max_len = max(seg_len) if seg_len else 0
             cat_segments = np.concatenate(
                 [
                     resample_segments(list(b.segments), max_len)
-                    if len(b.segments)
-                    else np.zeros((0, max_len, 2), dtype=np.float32)  # re-generating empty segments
+                    if len(b.segments) and isinstance(b.segments, np.ndarray)
+                    else np.zeros((0, max_len, 2), dtype=np.float32)
                     for b in instances_list
                 ],
                 axis=axis,
             )
         else:
-            cat_segments = np.concatenate([b.segments for b in instances_list], axis=axis)
+            cat_segments = (
+                np.concatenate([b.segments for b in instances_list if isinstance(b.segments, np.ndarray)], axis=axis)
+                if any(isinstance(b.segments, np.ndarray) for b in instances_list)
+                else []
+            )
         cat_keypoints = np.concatenate([b.keypoints for b in instances_list], axis=axis) if use_keypoint else None
         return cls(cat_boxes, cat_segments, cat_keypoints, bbox_format, normalized)
 

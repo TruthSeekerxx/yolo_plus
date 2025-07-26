@@ -628,8 +628,10 @@ class Model(torch.nn.Module):
         """
         custom = {"rect": True}  # method defaults
         args = {**self.overrides, **custom, **kwargs, "mode": "val"}  # highest priority args on the right
-
+        # NEW: Get nm from head and pass to validator.args
+        nm = getattr(self.model.model[-1], 'nm', 0) if hasattr(self.model, 'model') else 0
         validator = (validator or self._smart_load("validator"))(args=args, _callbacks=self.callbacks)
+        validator.args.nm = nm  # Set nm in validator.args for postprocess
         validator(model=self.model)
         self.metrics = validator.metrics
         return validator.metrics
